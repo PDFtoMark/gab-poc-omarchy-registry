@@ -1,0 +1,123 @@
+name: Build catalog
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'overrides/**'
+      - 'packages/**'
+      - 'scripts/**'
+      - '.github/workflows/build.yml'
+  schedule:
+    - cron: '23 */6 * * *' # every 6 h — refresh stars, HEAD, validation
+  workflow_dispatch:
+
+concurrency:
+  group: build-catalog
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write # post the change digest on the pinned issue; tell artists when their theme is out
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: R2-dev # holds CDN_BASE_URL/R2_BUCKET vars and the R2_* secrets; swap for prod later
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Restore build cache
+        uses: actions/cache@v6
+        with:
+          path: .work
+          key: catalog-work-${{ github.run_id }}
+          restore-keys: |
+            catalog-work-
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build catalog
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CDN_BASE_URL: ${{ vars.CDN_BASE_URL }}
+        run: pnpm build
+
+      - name: Upload to R2
+        if: ${{ vars.R2_BUCKET != '' }}
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: node scripts/upload.ts
+
+      - name: Publish build report
+        run: |
+          {
+            echo '### Catalog build'
+            node -e '
+              const r = require("./dist/report.json");
+              console.log(`Generated ${r.generated_at}`);
+              console.log("");
+              for (const [k, v] of Object.entries(r.counts)) console.log(`- ${k}: ${v}`);
+              if (r.problems.length) {
+                console.log(""); console.log("| theme | status | detail |"); console.log("|---|---|---|");
+                for (const p of r.problems) console.log(`| ${p.slug} | ${p.status} | ${(p.errors ?? [p.reason ?? "repository missing"]).slice(0,2).join("<br>").replaceAll("|","\\|")} |`);
+              }
+            '
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Add the change digest to the summary
+        run: |
+          if [ -f .work/digest-full.md ]; then
+            { echo; cat .work/digest-full.md; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Only once the catalog is uploaded, since only then are the changes live. Builds where no
+      # listed theme changed post nothing, so the issue is a history of changes rather than runs.
+      - name: Post the change digest on the pinned issue
+        if: ${{ vars.R2_BUCKET != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -f .work/digest.md ] && grep -q 'catalog-digest changed=true' .work/digest.md || exit 0
+
+          gh label create catalog-digest --color 1d76db --description 'Pinned issue: what each catalog build changed' --force
+          ISSUE=$(gh issue list --label catalog-digest --state open --json number --jq '.[0].number // empty')
+          if [ -z "$ISSUE" ]; then
+            ISSUE=$(gh issue create --title 'Catalog changes' --label catalog-digest \
+              --body 'Each catalog build that changes what people can install comments here: themes whose files changed (with before/after previews), themes newly listed or back, and themes dropped with the reason. Only files a marketplace install checks out are listed. Subscribe to get a notification per build; the full digest of every build is also in its run summary.' \
+              | grep -oE '[0-9]+$')
+            gh issue pin "$ISSUE"
+          fi
+          { cat .work/digest.md; echo; echo "[Build run]($RUN_URL)"; } > comment.md
+          gh issue comment "$ISSUE" --body-file comment.md
+
+      # A listed theme left out because of its repository: tell the artist on its submission issue
+      # (reopened) or a new one, and close it when the theme is back. Only after a real upload.
+      - name: Tell artists about themes that are out
+        if: ${{ vars.R2_BUCKET != '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/notify-artists.ts
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: catalog
+          path: |
+            dist/v1/catalog.json
+            dist/v1/catalog.min.json
+            dist/report.json
+            .work/digest-full.md
+          retention-days: 14

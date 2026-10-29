@@ -1,0 +1,124 @@
+/**
+ * Validate one or more themes exactly the way the catalog build does.
+ *
+ *   node scripts/validate.ts https://github.com/owner/omarchy-x-theme   # any repo, listed or not
+ *   node scripts/validate.ts x                                            # a registry slug
+ *   node scripts/validate.ts --changed                                    # entries changed vs origin/master, and overrides/ (CI)
+ *   node scripts/validate.ts --json                                       # machine-readable output
+ *
+ * Exit code 1 if any theme has errors.
+ */
+import { execFile } from 'node:child_process';
+import { basename } from 'node:path';
+import { promisify } from 'node:util';
+import {
+	GithubClient,
+	canonicalRepoUrl,
+	cloneRepo,
+	deriveSlug,
+	reportToMarkdown,
+	validateTheme
+} from '@omarchy-themes/validator';
+import type { ValidationReport } from '@omarchy-themes/schema';
+import { githubToken, loadOverrides, loadRegistry, log, probeImage } from './lib.ts';
+
+const exec = promisify(execFile);
+const args = process.argv.slice(2);
+const json = args.includes('--json');
+const targets = args.filter((a) => !a.startsWith('--'));
+
+const registry = await loadRegistry();
+const bySlug = new Map(registry.map((e) => [e.slug, e]));
+
+// The build fails on overrides it cannot parse and silently ignores a slug it does not know, so
+// catch both before they merge.
+async function overrideProblems(): Promise<string[]> {
+	let overrides;
+	try {
+		overrides = await loadOverrides();
+	} catch (e) {
+		return [`overrides/ does not parse: ${(e as Error).message}`];
+	}
+	const unknown = (file: string, slugs: string[]) =>
+		slugs.filter((s) => !bySlug.has(s)).map((s) => `${file}: \`${s}\` is not in themes/`);
+	return [
+		...unknown('featured.json', overrides.featured),
+		...unknown('hidden.json', Object.keys(overrides.hidden))
+	];
+}
+
+let overridesOk = true;
+const repos: { repo: string; slug: string | null }[] = [];
+if (args.includes('--changed')) {
+	const problems = await overrideProblems();
+	if (problems.length) {
+		overridesOk = false;
+		if (!json) console.log(`## ❌ overrides/\n\n${problems.map((p) => `- ${p}`).join('\n')}\n`);
+		else log(problems.join('\n'));
+	}
+
+	const { stdout } = await exec('git', [
+		'diff',
+		'--name-only',
+		'--diff-filter=AM',
+		'origin/master...HEAD',
+		'--',
+		'themes/'
+	]);
+	for (const f of stdout.split('\n').filter(Boolean)) {
+		const slug = basename(f, '.json');
+		const e = bySlug.get(slug);
+		if (e) repos.push({ repo: e.repo, slug });
+	}
+} else {
+	for (const t of targets) {
+		const e = bySlug.get(t);
+		if (e) repos.push({ repo: e.repo, slug: e.slug });
+		else {
+			const canon = canonicalRepoUrl(t);
+			if (!canon) throw new Error(`Not a slug or GitHub URL: ${t}`);
+			const slug = deriveSlug(canon);
+			repos.push({ repo: canon, slug: bySlug.has(slug) ? slug : null });
+		}
+	}
+}
+if (!repos.length) {
+	log('No theme entries to validate.');
+	process.exit(overridesOk ? 0 : 1);
+}
+
+const gh = new GithubClient({ token: githubToken() });
+const results: { repo: string; report: ValidationReport }[] = [];
+
+for (const { repo, slug } of repos) {
+	const meta = await gh.repo(repo);
+	let report: ValidationReport;
+	if (meta.missing) {
+		report = await validateTheme({ dir: process.cwd(), repoUrl: repo, meta, probeImage });
+		report.errors = report.errors.filter((e) => e.code === 'REPO_MISSING');
+		report.warnings = [];
+		report.ok = false;
+	} else {
+		// A listed theme is held to the repository its entry pins, as in the catalog build.
+		const entry = slug ? bySlug.get(slug) : undefined;
+		const listed = entry && entry.repo.toLowerCase() === repo.toLowerCase();
+		const co = await cloneRepo(repo);
+		try {
+			report = await validateTheme({
+				dir: co.dir,
+				repoUrl: repo,
+				meta,
+				...(listed ? { slug: entry.slug, expectedRepoId: entry.repo_id ?? null } : {}),
+				takenSlugs: registry.filter((e) => e.slug !== slug).map((e) => e.slug),
+				probeImage
+			});
+		} finally {
+			await co.cleanup();
+		}
+	}
+	results.push({ repo, report });
+	if (!json) console.log(reportToMarkdown(report, repo) + '\n');
+}
+
+if (json) console.log(JSON.stringify(results, null, 2));
+process.exit(overridesOk && results.every((r) => r.report.ok) ? 0 : 1);

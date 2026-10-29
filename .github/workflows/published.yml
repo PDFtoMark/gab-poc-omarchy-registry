@@ -1,0 +1,42 @@
+name: Submission published
+
+# When a submission PR (branch submit/<slug>) is merged, tell the author on the issue,
+# label it, and remove the branch. The catalog itself is rebuilt by build.yml on its six-hourly
+# schedule (merging themes/ does not trigger a build) or by a manual dispatch.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  notify:
+    if: github.event.pull_request.merged && startsWith(github.event.pull_request.head.ref, 'submit/')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REF: ${{ github.event.pull_request.head.ref }}
+      BODY: ${{ github.event.pull_request.body }}
+    steps:
+      - name: Notify the submission issue
+        run: |
+          SLUG="${REF#submit/}"
+          ISSUE=$(printf '%s' "$BODY" | grep -oiE 'closes #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+          if [ -n "$ISSUE" ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --remove-label validated,auto-approve,needs-changes --add-label published
+            # PRE-LAUNCH COPY. themes.omarchy.org is not public yet, so this deliberately does not
+            # link the theme page. Once the marketplace is live, delete this message and restore:
+            #
+            #   Merged. Your theme will be at https://themes.omarchy.org/themes/$SLUG after the next
+            #   catalog build — those run every six hours, so give it a little time to show up. It
+            #   follows your default branch from now on, so pushes to the repo update the listing at
+            #   the next build too.
+            #
+            gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "Merged — \`$SLUG\` is now in the registry. The marketplace site is not public yet, so there is nothing to link to for the moment; your theme will be there when it launches. Nothing more is needed from you: the listing follows your repository's default branch, so anything you push from now on is picked up automatically. Thanks for submitting."
+            gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY" || true
+          fi
+      - name: Delete the submission branch
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$REF" || true

@@ -1,0 +1,216 @@
+/**
+ * Turn a submission (issue form or flags) into a validated `themes/<slug>.json`.
+ *
+ *   node scripts/submit.ts --repo https://github.com/o/omarchy-x-theme --name "X" --submitted-by login
+ *   node scripts/submit.ts --issue-body-file body.md --submitted-by login --write --json
+ *
+ * Prints a JSON result (with --json) or the Markdown report. Never exits non-zero for a bad
+ * submission — the result's `ok` says whether an entry was produced — only for crashes.
+ */
+import { parseArgs } from 'node:util';
+import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import {
+	GithubClient,
+	canonicalRepoUrl,
+	cloneRepo,
+	assignSlug,
+	deriveSlug,
+	parseIssueForm,
+	reportToMarkdown,
+	repoFindings,
+	validateTheme
+} from '@omarchy-themes/validator';
+import { RegistryEntry, type Finding, type ValidationReport } from '@omarchy-themes/schema';
+import {
+	REGISTRY_REPO,
+	THEMES_DIR,
+	githubToken,
+	loadRegistry,
+	probeImage,
+	writeJson
+} from './lib.ts';
+
+const { values: args } = parseArgs({
+	options: {
+		repo: { type: 'string' },
+		name: { type: 'string' },
+		'submitted-by': { type: 'string' },
+		'issue-body-file': { type: 'string' },
+		write: { type: 'boolean', default: false },
+		json: { type: 'boolean', default: false }
+	}
+});
+
+interface Result {
+	ok: boolean;
+	slug: string | null;
+	name: string | null;
+	repo: string | null;
+	submitted_by: string;
+	/** submitter owns the repo (user) or is a public member of the owning org */
+	owner_verified: boolean;
+	/** what Omarchy derives from the repo name; differs from `slug` when that name was taken */
+	derived_slug: string | null;
+	/** set when this repo is already in the registry */
+	existing_slug: string | null;
+	entry: RegistryEntry | null;
+	/** path written (with --write) */
+	file: string | null;
+	errors: Finding[];
+	report: ValidationReport | null;
+	markdown: string;
+}
+
+const submittedBy = args['submitted-by'];
+if (!submittedBy) throw new Error('--submitted-by is required');
+
+let repoInput = args.repo ?? null;
+let name = args.name ?? null;
+if (args['issue-body-file']) {
+	const form = parseIssueForm(await readFile(args['issue-body-file'], 'utf8'));
+	repoInput ??= form.repo;
+	name ??= form.name;
+}
+
+const result: Result = {
+	ok: false,
+	slug: null,
+	name,
+	repo: null,
+	submitted_by: submittedBy,
+	owner_verified: false,
+	derived_slug: null,
+	existing_slug: null,
+	entry: null,
+	file: null,
+	errors: [],
+	report: null,
+	markdown: ''
+};
+
+const fail = (code: string, message: string) => result.errors.push({ code, message });
+
+const canon = repoInput ? canonicalRepoUrl(repoInput) : null;
+if (!repoInput) fail('NO_REPO', 'No repository URL found in the submission.');
+else if (!canon)
+	fail(
+		'REPO_NOT_GITHUB',
+		`\`${repoInput}\` is not a GitHub repository URL (https://github.com/<owner>/<repo>).`
+	);
+
+const registry = await loadRegistry();
+
+if (canon) {
+	result.repo = canon;
+	const gh = new GithubClient({ token: githubToken() });
+	const meta = await gh.repo(canon);
+	if (!meta.missing && meta.movedTo) result.repo = meta.movedTo;
+
+	const listed = registry.find((e) => e.repo.toLowerCase() === result.repo!.toLowerCase());
+	if (listed) {
+		result.existing_slug = listed.slug;
+		fail(
+			'ALREADY_LISTED',
+			`This repository is already in the registry as \`${listed.slug}\`. The catalog follows its default branch, so updates need no new submission.`
+		);
+	} else if (meta.missing) {
+		fail('REPO_MISSING', 'Repository does not exist or is not public.');
+	} else if (repoFindings(meta).errors.length) {
+		// Private or too large: GitHub's metadata already says so, no need to clone it first.
+		for (const e of repoFindings(meta).errors) fail(e.code, e.message);
+	} else {
+		// Slugs waiting in another submission's open pull request are taken too; otherwise both
+		// would write themes/<slug>.json and push to the same submit/<slug> branch.
+		const pending = await gh.pendingSubmissions(REGISTRY_REPO);
+		const repoKey = result.repo.toLowerCase();
+		const takenSlugs = [
+			...registry.map((e) => e.slug),
+			...[...pending].filter(([, repo]) => repo.toLowerCase() !== repoKey).map(([slug]) => slug)
+		];
+		result.derived_slug = deriveSlug(result.repo);
+		const slug = assignSlug(result.repo, meta.owner, takenSlugs);
+		const co = await cloneRepo(result.repo);
+		try {
+			result.report = await validateTheme({
+				dir: co.dir,
+				repoUrl: result.repo,
+				slug,
+				meta,
+				takenSlugs,
+				probeImage
+			});
+		} finally {
+			await co.cleanup();
+		}
+		result.owner_verified = await gh.controlsRepo(submittedBy, meta);
+		result.slug = result.report.facts.slug ?? slug;
+		// The display name comes from the repo, not from an owner suffix added to the install name.
+		result.name ??= titleCase(result.derived_slug);
+
+		if (result.report.ok) {
+			const parsed = RegistryEntry.safeParse({
+				slug: result.slug,
+				repo: result.repo,
+				repo_id: meta.id,
+				name: result.name,
+				submitted_by: submittedBy,
+				added_at: new Date().toISOString().slice(0, 10)
+			});
+			if (parsed.success) {
+				result.entry = parsed.data;
+				result.ok = true;
+				if (args.write) {
+					result.file = join(THEMES_DIR, `${result.slug}.json`);
+					await writeJson(result.file, result.entry);
+				}
+			} else {
+				for (const i of parsed.error.issues)
+					fail('ENTRY_INVALID', `${i.path.join('.') || 'entry'}: ${i.message}`);
+			}
+		}
+	}
+}
+
+result.markdown = toMarkdown(result);
+if (args.json) console.log(JSON.stringify(result, null, 2));
+else console.log(result.markdown);
+
+function titleCase(slug: string): string {
+	return slug
+		.split(/[-_.]+/)
+		.filter(Boolean)
+		.map((w) => w[0]!.toUpperCase() + w.slice(1))
+		.join(' ');
+}
+
+function toMarkdown(r: Result): string {
+	const lines: string[] = [];
+	if (r.report) {
+		lines.push(reportToMarkdown(r.report, `Submission of \`${r.slug}\``));
+	} else {
+		lines.push(`### Submission: ❌ needs changes`);
+	}
+	if (r.errors.length) {
+		lines.push('', '**Errors (must fix):**');
+		for (const f of r.errors) lines.push(`- \`${f.code}\` — ${f.message}`);
+	}
+	lines.push('');
+	if (r.slug && r.derived_slug && r.slug !== r.derived_slug)
+		lines.push(
+			`\`${r.derived_slug}\` is already the name of another theme, so this one installs as \`${r.slug}\`: \`omarchy theme install ${r.slug}\`.`,
+			''
+		);
+	if (r.ok) {
+		lines.push(
+			r.owner_verified
+				? `Submitted by the repository owner — this will be published once a maintainer merges the pull request.`
+				: `The submitter does not appear to own \`${r.repo}\` (or is a private org member), so a maintainer will confirm the listing before merging.`
+		);
+	} else {
+		lines.push(
+			'Fix the errors in the theme repository, then comment `/recheck` on this issue to run validation again.'
+		);
+	}
+	return lines.join('\n');
+}
